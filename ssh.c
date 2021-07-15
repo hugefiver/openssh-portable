@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh.c,v 1.553 2021/04/03 05:40:39 djm Exp $ */
+/* $OpenBSD: ssh.c,v 1.560 2021/07/13 23:48:36 djm Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -126,9 +126,6 @@ int debug_flag = 0;
 /* Flag indicating whether a tty should be requested */
 int tty_flag = 0;
 
-/* don't exec a shell */
-int no_shell_flag = 0;
-
 /*
  * Flag indicating that nothing should be read from stdin.  This can be set
  * on the command line.
@@ -142,7 +139,7 @@ int stdin_null_flag = 0;
 int need_controlpersist_detach = 0;
 
 /* Copies of flags for ControlPersist foreground mux-client */
-int ostdin_null_flag, ono_shell_flag, otty_flag, orequest_tty;
+int ostdin_null_flag, osession_type, otty_flag, orequest_tty;
 
 /*
  * Flag indicating that ssh should fork after authentication.  This is useful
@@ -181,9 +178,6 @@ Sensitive sensitive_data;
 
 /* command to be executed */
 struct sshbuf *command;
-
-/* Should we execute a command or invoke a subsystem? */
-int subsystem_flag = 0;
 
 /* # of replies received for global requests */
 static int forward_confirms_pending = -1;
@@ -504,6 +498,8 @@ resolve_canonicalize(char **hostp, int port)
 	}
 	/* Attempt each supplied suffix */
 	for (i = 0; i < options.num_canonical_domains; i++) {
+		if (strcasecmp(options.canonical_domains[i], "none") == 0)
+			break;
 		xasprintf(&fullhost, "%s.%s.", *hostp,
 		    options.canonical_domains[i]);
 		debug3_f("attempting \"%s\" => \"%s\"", *hostp, fullhost);
@@ -651,6 +647,12 @@ main(int ac, char **av)
 	/* Ensure that fds 0, 1 and 2 are open or directed to /dev/null */
 	sanitise_stdfd();
 
+	/*
+	 * Discard other fds that are hanging around. These can cause problem
+	 * with backgrounded ssh processes started by ControlPersist.
+	 */
+	closefrom(STDERR_FILENO + 1);
+
 	__progname = ssh_get_progname(av[0]);
 
 #ifndef HAVE_SETPROCTITLE
@@ -665,12 +667,6 @@ main(int ac, char **av)
 #endif
 
 	seed_rng();
-
-	/*
-	 * Discard other fds that are hanging around. These can cause problem
-	 * with backgrounded ssh processes started by ControlPersist.
-	 */
-	closefrom(STDERR_FILENO + 1);
 
 	/* Get user data. */
 	pw = getpwuid(getuid());
@@ -919,7 +915,7 @@ main(int ac, char **av)
 				exit(255);
 			}
 			options.request_tty = REQUEST_TTY_NO;
-			no_shell_flag = 1;
+			options.session_type = SESSION_TYPE_NONE;
 			break;
 		case 'q':
 			options.log_level = SYSLOG_LEVEL_QUIET;
@@ -1022,7 +1018,10 @@ main(int ac, char **av)
 #endif
 			break;
 		case 'N':
-			no_shell_flag = 1;
+			if (options.session_type != -1 &&
+			    options.session_type != SESSION_TYPE_NONE)
+				fatal("Cannot specify -N with -s/SessionType");
+			options.session_type = SESSION_TYPE_NONE;
 			options.request_tty = REQUEST_TTY_NO;
 			break;
 		case 'T':
@@ -1037,7 +1036,10 @@ main(int ac, char **av)
 			free(line);
 			break;
 		case 's':
-			subsystem_flag = 1;
+			if (options.session_type != -1 &&
+			    options.session_type != SESSION_TYPE_SUBSYSTEM)
+				fatal("Cannot specify -s with -N/SessionType");
+			options.session_type = SESSION_TYPE_SUBSYSTEM;
 			break;
 		case 'S':
 			free(options.control_path);
@@ -1120,7 +1122,7 @@ main(int ac, char **av)
 	 */
 	if (!ac) {
 		/* No command specified - execute shell on a tty. */
-		if (subsystem_flag) {
+		if (options.session_type == SESSION_TYPE_SUBSYSTEM) {
 			fprintf(stderr,
 			    "You must specify a subsystem to invoke.\n");
 			usage();
@@ -1329,14 +1331,17 @@ main(int ac, char **av)
 
 	/* Cannot fork to background if no command. */
 	if (fork_after_authentication_flag && sshbuf_len(command) == 0 &&
-	    options.remote_command == NULL && !no_shell_flag)
+	    options.remote_command == NULL && options.session_type != SESSION_TYPE_NONE)
 		fatal("Cannot fork into background without a command "
 		    "to execute.");
 
 	/* reinit */
 	log_init(argv0, options.log_level, options.log_facility, !use_syslog);
-	for (j = 0; j < options.num_log_verbose; j++)
+	for (j = 0; j < options.num_log_verbose; j++) {
+		if (strcasecmp(options.log_verbose[j], "none") == 0)
+			break;
 		log_verbose_add(options.log_verbose[j]);
+	}
 
 	if (options.request_tty == REQUEST_TTY_YES ||
 	    options.request_tty == REQUEST_TTY_FORCE)
@@ -1876,9 +1881,10 @@ ssh_init_stdio_forwarding(struct ssh *ssh)
 
 	if ((in = dup(STDIN_FILENO)) == -1 ||
 	    (out = dup(STDOUT_FILENO)) == -1)
-		fatal("channel_connect_stdio_fwd: dup() in/out failed");
+		fatal_f("dup() in/out failed");
 	if ((c = channel_connect_stdio_fwd(ssh, options.stdio_forward_host,
-	    options.stdio_forward_port, in, out)) == NULL)
+	    options.stdio_forward_port, in, out,
+	    CHANNEL_NONBLOCK_STDIO)) == NULL)
 		fatal_f("channel_connect_stdio_fwd failed");
 	channel_register_cleanup(ssh, c->self, client_cleanup_stdio_fwd, 0);
 	channel_register_open_confirm(ssh, c->self, ssh_stdio_confirm, NULL);
@@ -2017,7 +2023,7 @@ static void
 ssh_session2_setup(struct ssh *ssh, int id, int success, void *arg)
 {
 	extern char **environ;
-	const char *display;
+	const char *display, *term;
 	int r, interactive = tty_flag;
 	char *proto = NULL, *data = NULL;
 
@@ -2052,7 +2058,10 @@ ssh_session2_setup(struct ssh *ssh, int id, int success, void *arg)
 	ssh_packet_set_interactive(ssh, interactive,
 	    options.ip_qos_interactive, options.ip_qos_bulk);
 
-	client_session2_setup(ssh, id, tty_flag, subsystem_flag, getenv("TERM"),
+	if ((term = lookup_env_in_list("TERM", options.setenv,
+	    options.num_setenv)) == NULL || *term == '\0')
+		term = getenv("TERM");
+	client_session2_setup(ssh, id, tty_flag, options.session_type == SESSION_TYPE_SUBSYSTEM, term,
 	    NULL, fileno(stdin), command, environ);
 }
 
@@ -2074,14 +2083,6 @@ ssh_session2_open(struct ssh *ssh)
 	if (in == -1 || out == -1 || err == -1)
 		fatal("dup() in/out/err failed");
 
-	/* enable nonblocking unless tty */
-	if (!isatty(in))
-		set_nonblock(in);
-	if (!isatty(out))
-		set_nonblock(out);
-	if (!isatty(err))
-		set_nonblock(err);
-
 	window = CHAN_SES_WINDOW_DEFAULT;
 	packetmax = CHAN_SES_PACKET_DEFAULT;
 	if (tty_flag) {
@@ -2091,12 +2092,12 @@ ssh_session2_open(struct ssh *ssh)
 	c = channel_new(ssh,
 	    "session", SSH_CHANNEL_OPENING, in, out, err,
 	    window, packetmax, CHAN_EXTENDED_WRITE,
-	    "client-session", /*nonblock*/0);
+	    "client-session", CHANNEL_NONBLOCK_STDIO);
 
 	debug3_f("channel_new: %d", c->self);
 
 	channel_send_open(ssh, c->self);
-	if (!no_shell_flag)
+	if (options.session_type != SESSION_TYPE_NONE)
 		channel_register_open_confirm(ssh, c->self,
 		    ssh_session2_setup, NULL);
 
@@ -2141,13 +2142,14 @@ ssh_session2(struct ssh *ssh, const struct ssh_conn_info *cinfo)
 	 */
 	if (options.control_persist && muxserver_sock != -1) {
 		ostdin_null_flag = stdin_null_flag;
-		ono_shell_flag = no_shell_flag;
+		osession_type = options.session_type;
 		orequest_tty = options.request_tty;
 		otty_flag = tty_flag;
 		stdin_null_flag = 1;
-		no_shell_flag = 1;
+		options.session_type = SESSION_TYPE_NONE;
 		tty_flag = 0;
-		if (!fork_after_authentication_flag)
+		if (!fork_after_authentication_flag &&
+		    (osession_type != SESSION_TYPE_NONE || options.stdio_forward_host != NULL))
 			need_controlpersist_detach = 1;
 		fork_after_authentication_flag = 1;
 	}
@@ -2158,7 +2160,7 @@ ssh_session2(struct ssh *ssh, const struct ssh_conn_info *cinfo)
 	if (options.control_persist && muxserver_sock == -1)
 		ssh_init_stdio_forwarding(ssh);
 
-	if (!no_shell_flag)
+	if (options.session_type != SESSION_TYPE_NONE)
 		id = ssh_session2_open(ssh);
 	else {
 		ssh_packet_set_interactive(ssh,

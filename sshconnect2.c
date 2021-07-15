@@ -1,4 +1,4 @@
-/* $OpenBSD: sshconnect2.c,v 1.347 2021/04/03 06:18:41 djm Exp $ */
+/* $OpenBSD: sshconnect2.c,v 1.350 2021/07/02 05:11:21 dtucker Exp $ */
 /*
  * Copyright (c) 2000 Markus Friedl.  All rights reserved.
  * Copyright (c) 2008 Damien Miller.  All rights reserved.
@@ -442,8 +442,6 @@ ssh_userauth2(struct ssh *ssh, const char *local_user,
 	Authctxt authctxt;
 	int r;
 
-	if (options.challenge_response_authentication)
-		options.kbd_interactive_authentication = 1;
 	if (options.preferred_authentications == NULL)
 		options.preferred_authentications = authmethods_get();
 
@@ -1175,6 +1173,7 @@ static char *
 key_sig_algorithm(struct ssh *ssh, const struct sshkey *key)
 {
 	char *allowed, *oallowed, *cp, *tmp, *alg = NULL;
+	const char *server_sig_algs;
 
 	/*
 	 * The signature algorithm will only differ from the key algorithm
@@ -1190,6 +1189,14 @@ key_sig_algorithm(struct ssh *ssh, const struct sshkey *key)
 	}
 
 	/*
+	 * Workaround OpenSSH 7.4 bug: this version supports RSA/SHA-2 but
+	 * fails to advertise it via SSH2_MSG_EXT_INFO.
+	 */
+	server_sig_algs = ssh->kex->server_sig_algs;
+	if (key->type == KEY_RSA && (ssh->compat & SSH_BUG_SIGTYPE74))
+		server_sig_algs = "rsa-sha2-256,rsa-sha2-512";
+
+	/*
 	 * For RSA keys/certs, since these might have a different sig type:
 	 * find the first entry in PubkeyAcceptedAlgorithms of the right type
 	 * that also appears in the supported signature algorithms list from
@@ -1200,7 +1207,7 @@ key_sig_algorithm(struct ssh *ssh, const struct sshkey *key)
 		if (sshkey_type_from_name(cp) != key->type)
 			continue;
 		tmp = match_list(sshkey_sigalg_by_name(cp),
-		    ssh->kex->server_sig_algs, NULL);
+		    server_sig_algs, NULL);
 		if (tmp != NULL)
 			alg = xstrdup(cp);
 		free(tmp);
@@ -1373,8 +1380,8 @@ sign_and_send_pubkey(struct ssh *ssh, Identity *id)
 		}
 		if (sign_id != NULL) {
 			debug2_f("using private key \"%s\"%s for "
-			    "certificate", id->filename,
-			    id->agent_fd != -1 ? " from agent" : "");
+			    "certificate", sign_id->filename,
+			    sign_id->agent_fd != -1 ? " from agent" : "");
 		} else {
 			debug_f("no separate private key for certificate "
 			    "\"%s\"", id->filename);
